@@ -1,0 +1,306 @@
+"""
+local_assistant_with_protected_filters.py
+
+Один файл: локальный настраиваемый ассистент (FastAPI) с:
+ - PROTECTED (неудаляемые) шаблоны блокировки для явно опасного контента
+ - custom_filters.json (рядом) — редактируемый файл с дополнительными шаблонами, которые ты можешь менять/удалять
+ - поддержка локальной HF модели (transformers) или OpenAI API (опционально)
+ - endpoints: /chat, /filters, /config, /health
+
+Запуск: uvicorn local_assistant_with_protected_filters:app --host 0.0.0.0 --port 8000 --reload
+"""
+
+import os
+import re
+import json
+import time
+import logging
+from typing import Optional, List, Dict, Any
+
+from fastapi import FastAPI, HTTPException
+from pydantic import BaseModel
+
+# Попытка импортировать опциональные зависимости
+HF_AVAILABLE = False
+OPENAI_AVAILABLE = False
+try:
+    from transformers import AutoModelForCausalLM, AutoTokenizer
+    import torch
+    HF_AVAILABLE = True
+except Exception:
+    HF_AVAILABLE = False
+
+try:
+    import openai
+    OPENAI_AVAILABLE = True
+except Exception:
+    OPENAI_AVAILABLE = False
+
+# ----------------- Config / State -----------------
+APP_DIR = os.path.abspath(os.path.dirname(__file__))
+CUSTOM_FILTERS_PATH = os.path.join(APP_DIR, "custom_filters.json")
+
+# Неудаляемые (обязательные) шаблоны — оставлены намеренно.
+# Они охватывают: изготовление взрывчатки/оружия, инструкции для убийства/нанесения вреда,
+# инструкции по взлому/несанкционированному доступу, сексуальное насилие над детьми, торговлю людьми, отравление и т.д.
+PROTECTED_BLOCK_PATTERNS = [
+    r"\b(create bomb|make a bomb|detonate|how to make explosives)\b",
+    r"\b(kill (someone|him|her|them)|assassinat|how to assassinate)\b",
+    r"\b(how to hack|how to break into|exploit vulnerability|bypass authentication|crack password|keylogger)\b",
+    r"\b(ddos|denial of service|perform a ddos|launch ddos)\b",
+    r"\b(manufacture firearms|make a gun|build a weapon)\b",
+    r"\b(child sexual|child porn|sex with a child|minor sexual)\b",
+    r"\b(traffick(ing)? in persons|human trafficking)\b",
+    r"\b(poison someone|how to poison)\b",
+    r"\b(chemicals to (kill|harm)|toxic)\b",
+    r"\b(evade law enforcement|avoid police|cover up)\b",
+]
+
+# По умолчанию custom-фильтров будет примерный набор — ты можешь его удалить из файла или заменить.
+DEFAULT_CUSTOM_FILTERS = {
+    "block_patterns": [
+        # Пример дополнительных паттернов — ты можешь удалить/изменить эти строки в custom_filters.json
+        r"\b(spam|buy followers|how to write spam)\b",
+        r"\b(illegal marketplace|sell stolen)\b"
+    ],
+    "description": "Редактируемые фильтры. Удали или измени 'block_patterns' если хочешь отключить дополнительные блокировки."
+}
+
+# STATE
+STATE: Dict[str, Any] = {
+    "system_prompt": "Ты — локальный ассистент. Отвечай ясно и по существу.",
+    "backend": "local" if HF_AVAILABLE else ("openai" if OPENAI_AVAILABLE else "echo"),
+    "hf_model": "gpt2",  # замени на доступную модель для лучшего ответа
+    "openai_model": "gpt-4o-mini",
+    "openai_api_key": os.environ.get("OPENAI_API_KEY", ""),
+}
+
+# Logging
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+logger = logging.getLogger("local_assistant_protected")
+
+# ----------------- Helpers: filters file -----------------
+def ensure_custom_filters_file():
+    """Создаёт custom_filters.json с примером, если файла нет."""
+    if not os.path.exists(CUSTOM_FILTERS_PATH):
+        logger.info("custom_filters.json не найден — создаю файл с примерами.")
+        try:
+            with open(CUSTOM_FILTERS_PATH, "w", encoding="utf-8") as f:
+                json.dump(DEFAULT_CUSTOM_FILTERS, f, indent=2, ensure_ascii=False)
+        except Exception as e:
+            logger.exception("Не удалось создать custom_filters.json: %s", e)
+            raise
+
+def load_custom_filters() -> Dict[str, Any]:
+    """Загружает custom filters; если файл отсутствует — создаёт пример и возвращает его."""
+    ensure_custom_filters_file()
+    try:
+        with open(CUSTOM_FILTERS_PATH, "r", encoding="utf-8") as f:
+            data = json.load(f)
+            # Нормализуем структуру
+            if "block_patterns" not in data or not isinstance(data["block_patterns"], list):
+                data["block_patterns"] = []
+            return data
+    except Exception as e:
+        logger.exception("Ошибка чтения custom_filters.json: %s", e)
+        return {"block_patterns": []}
+
+def save_custom_filters(data: Dict[str, Any]):
+    """Перезаписывает custom_filters.json."""
+    try:
+        with open(CUSTOM_FILTERS_PATH, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2, ensure_ascii=False)
+        logger.info("custom_filters.json обновлён.")
+    except Exception as e:
+        logger.exception("Не удалось сохранить custom_filters.json: %s", e)
+        raise
+
+# ----------------- Filter checking -----------------
+def matches_any_pattern(text: str, patterns: List[str]) -> Optional[str]:
+    """Возвращает первый паттерн, который совпал, или None."""
+    t = text.lower()
+    for pat in patterns:
+        try:
+            if re.search(pat, t):
+                return pat
+        except re.error:
+            # если паттерн некорректен — логируем, но пропускаем
+            logger.warning("Некорректный regex в фильтрах: %s", pat)
+            continue
+    return None
+
+def check_protected_block(text: str) -> Optional[str]:
+    """Проверка защищённых шаблонов — всегда блокирует."""
+    return matches_any_pattern(text, PROTECTED_BLOCK_PATTERNS)
+
+def check_custom_block(text: str) -> Optional[str]:
+    """Проверка пользовательских шаблонов из custom_filters.json."""
+    cf = load_custom_filters()
+    patterns = cf.get("block_patterns", [])
+    return matches_any_pattern(text, patterns)
+
+# ----------------- Model backends -----------------
+LOCAL_MODEL = None
+LOCAL_TOKENIZER = None
+
+def init_local_model():
+    global LOCAL_MODEL, LOCAL_TOKENIZER
+    if not HF_AVAILABLE:
+        raise RuntimeError("transformers/torch не установлены.")
+    if LOCAL_MODEL is None:
+        model_id = STATE.get("hf_model", "gpt2")
+        logger.info("Загружаю локальную модель %s ...", model_id)
+        LOCAL_TOKENIZER = AutoTokenizer.from_pretrained(model_id, use_fast=False)
+        LOCAL_MODEL = AutoModelForCausalLM.from_pretrained(model_id)
+        if torch.cuda.is_available():
+            LOCAL_MODEL.to("cuda")
+        logger.info("Локальная модель загружена.")
+
+def generate_local(prompt: str, max_new_tokens: int = 150) -> str:
+    init_local_model()
+    inputs = LOCAL_TOKENIZER(prompt, return_tensors="pt")
+    if torch.cuda.is_available():
+        inputs = {k: v.to("cuda") for k, v in inputs.items()}
+    with torch.no_grad():
+        out = LOCAL_MODEL.generate(**inputs, max_new_tokens=max_new_tokens)
+    text = LOCAL_TOKENIZER.decode(out[0], skip_special_tokens=True)
+    return text
+
+def generate_openai(prompt: str, max_tokens: int = 256) -> str:
+    if not OPENAI_AVAILABLE or not STATE.get("openai_api_key"):
+        raise RuntimeError("OpenAI backend недоступен или ключ не указан.")
+    openai.api_key = STATE["openai_api_key"]
+    resp = openai.ChatCompletion.create(
+        model=STATE.get("openai_model"),
+        messages=[
+            {"role": "system", "content": STATE["system_prompt"]},
+            {"role": "user", "content": prompt}
+        ],
+        max_tokens=max_tokens,
+        temperature=0.7,
+    )
+    return resp.choices[0].message.content
+
+def generate_echo(prompt: str, **kwargs) -> str:
+    return f"[ECHO] {STATE['system_prompt']}\n\nUser: {prompt}\n\nAssistant: режим echo — установи локальную модель или OpenAI."
+
+# ----------------- FastAPI app -----------------
+app = FastAPI(title="Local Assistant (protected filters)")
+
+# ---- Pydantic models ----
+class ChatRequest(BaseModel):
+    prompt: str
+    max_tokens: Optional[int] = 256
+
+class ChatResponse(BaseModel):
+    allowed: bool
+    reason: Optional[str] = None
+    response: Optional[str] = None
+    elapsed: float
+
+class FiltersUpdate(BaseModel):
+    block_patterns: List[str]
+
+class ConfigUpdate(BaseModel):
+    system_prompt: Optional[str] = None
+    backend: Optional[str] = None  # local | openai | echo
+    hf_model: Optional[str] = None
+    openai_model: Optional[str] = None
+    openai_api_key: Optional[str] = None
+
+# ---- Endpoints ----
+@app.post("/chat", response_model=ChatResponse)
+def chat(req: ChatRequest):
+    start = time.time()
+    prompt = (req.prompt or "").strip()
+    if not prompt:
+        raise HTTPException(status_code=400, detail="prompt не может быть пустым")
+
+    # 1) Проверка защищённых шаблонов (всегда блокирует)
+    prot = check_protected_block(prompt)
+    if prot:
+        reason = f"Запрещено (protected pattern matched): {prot}"
+        logger.warning("Blocked by PROTECTED pattern: %s | prompt=%s", prot, prompt[:200])
+        return ChatResponse(allowed=False, reason=reason, response=None, elapsed=time.time()-start)
+
+    # 2) Проверка кастомных шаблонов (если есть) — блокирует, но их можно редактировать/удалить в custom_filters.json
+    custom = check_custom_block(prompt)
+    if custom:
+        reason = f"Заблокировано custom-фильтром: {custom} (см. custom_filters.json)"
+        logger.info("Blocked by custom filter: %s | prompt=%s", custom, prompt[:200])
+        return ChatResponse(allowed=False, reason=reason, response=None, elapsed=time.time()-start)
+
+    # 3) Формируем полный промпт и генерируем ответ
+    full_prompt = STATE.get("system_prompt", "") + "\n\nUser: " + prompt + "\nAssistant:"
+    try:
+        if STATE.get("backend") == "local":
+            if not HF_AVAILABLE:
+                raise HTTPException(status_code=500, detail="Local backend недоступен (установите transformers/torch).")
+            out = generate_local(full_prompt, max_new_tokens=req.max_tokens or 256)
+        elif STATE.get("backend") == "openai":
+            if not OPENAI_AVAILABLE:
+                raise HTTPException(status_code=500, detail="OpenAI backend недоступен (установите библиотеку openai).")
+            out = generate_openai(prompt, max_tokens=req.max_tokens or 256)
+        else:
+            out = generate_echo(prompt)
+    except Exception as e:
+        logger.exception("Ошибка генерации")
+        raise HTTPException(status_code=500, detail=str(e))
+
+    elapsed = time.time() - start
+    logger.info("Response generated (backend=%s) in %.2fs", STATE.get("backend"), elapsed)
+    return ChatResponse(allowed=True, reason=None, response=out, elapsed=elapsed)
+
+@app.get("/filters")
+def get_filters():
+    """Вернуть содержимое custom_filters.json (editable локально)."""
+    data = load_custom_filters()
+    return data
+
+@app.post("/filters")
+def update_filters(upd: FiltersUpdate):
+    """Заменяет custom_filters.json — будь осторожен. PROTECTED шаблоны не трогаются."""
+    new = {"block_patterns": upd.block_patterns}
+    save_custom_filters(new)
+    return {"status": "ok", "message": "custom_filters.json обновлён."}
+
+@app.get("/config")
+def get_config():
+    cfg = {k: v for k, v in STATE.items()}
+    cfg["openai_api_key"] = "SET" if STATE.get("openai_api_key") else ""
+    return cfg
+
+@app.post("/config")
+def update_config(cfg: ConfigUpdate):
+    if cfg.system_prompt is not None:
+        STATE["system_prompt"] = cfg.system_prompt
+    if cfg.backend is not None:
+        if cfg.backend not in ("local", "openai", "echo"):
+            raise HTTPException(status_code=400, detail="backend должен быть 'local','openai' или 'echo'")
+        STATE["backend"] = cfg.backend
+    if cfg.hf_model is not None:
+        STATE["hf_model"] = cfg.hf_model
+    if cfg.openai_model is not None:
+        STATE["openai_model"] = cfg.openai_model
+    if cfg.openai_api_key is not None:
+        STATE["openai_api_key"] = cfg.openai_api_key
+        STATE["openai_api_key"] = cfg.openai_api_key
+    return {"status": "ok", "state": {k: v for k, v in STATE.items() if k != "openai_api_key"}}
+
+@app.get("/health")
+def health():
+    return {
+        "status": "ok",
+        "backend": STATE.get("backend"),
+        "hf_available": HF_AVAILABLE,
+        "openai_available": OPENAI_AVAILABLE,
+        "custom_filters_file": CUSTOM_FILTERS_PATH
+    }
+
+# При первом импорте / запуске — убедимся, что custom_filters.json есть
+ensure_custom_filters_file()
+
+# ---- Run note ----
+if __name__ == "__main__":
+    print("Этот файл предназначен для запуска через uvicorn, например:")
+    print("uvicorn local_assistant_with_protected_filters:app --host 0.0.0.0 --port 8000 --reload")
